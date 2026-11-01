@@ -1,0 +1,49 @@
+{
+    "name": "astrx/mail",
+    "description": "SMTP and IMAP clients, and the mailbox management webmail needs.",
+    "license": "LicenseRef-DoWhatever",
+    "type": "library",
+    "keywords": [
+        "astrx",
+        "no-javascript",
+        "server-rendered"
+    ],
+    "homepage": "https://github.com/Vxmdzhb/mail",
+    "require": {
+        "php": ">=8.4",
+        "ext-filter": "*",
+        "ext-iconv": "*",
+        "ext-mbstring": "*",
+        "astrx/config": "self.version",
+        "astrx/result": "self.version"
+    },
+    "suggest": {
+        "ext-openssl": "TLS for SMTP and IMAP (STARTTLS and implicit TLS)"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "autoload": {
+        "psr-4": {
+            "AstrX\\Mail\\": ""
+        }
+    },
+    "extra": {
+        "astrx": {
+            "resources": "resources"
+        }
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/Vxmdzhb/result"
+        },
+        {
+            "type": "vcs",
+            "url": "https://github.com/Vxmdzhb/support"
+        },
+        {
+            "type": "vcs",
+            "url": "https://github.com/Vxmdzhb/config"
+        }
+    ]
+}
