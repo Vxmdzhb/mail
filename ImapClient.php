@@ -109,14 +109,15 @@ final class ImapClient
             $this->loggedIn = false;
             $greetingRaw = $this->readLine();
             $greeting = is_string($greetingRaw) ? $greetingRaw : '';
-            if (!str_starts_with($greeting, '* OK') && !str_starts_with($greeting, '* PREAUTH')) {
+            $status = strtoupper(explode(' ', $greeting, 3)[1] ?? '');
+            if (!str_starts_with($greeting, '* ') || !in_array($status, ['OK', 'PREAUTH'], true)) {
                 return $this->err('connect', "Unexpected greeting: $greeting");
             }
             // Only treat PREAUTH as already-authenticated when explicitly
             // configured. Otherwise ignore the assertion and continue as for a
             // plain greeting, so a hostile/MITM server cannot use PREAUTH to skip
             // the STARTTLS upgrade below or the LOGIN credential exchange.
-            if ($this->allowPreauth && str_starts_with($greeting, '* PREAUTH')) {
+            if ($this->allowPreauth && $status === 'PREAUTH') {
                 $this->loggedIn = true;
             }
             // STARTTLS upgrade
@@ -228,17 +229,6 @@ final class ImapClient
         $high = $total - (($page - 1) * $perPage);
         $low  = max(1, $high - $perPage + 1);
         $set  = "{$low}:{$high}";
-
-        $r = $this->command("UID SEARCH {$low}:{$high} ALL");
-        if ($r->isOk()) {
-            // Get UIDs for this range
-            $uids = [];
-            foreach ($this->untaggedLines() as $line) {
-                if (preg_match('/^\* SEARCH (.+)/', $line, $m)) {
-                    $uids = array_map('intval', explode(' ', trim($m[1])));
-                }
-            }
-        }
 
         // Fetch envelope+flags for the sequence range
         $r = $this->command("FETCH {$set} (UID FLAGS ENVELOPE)");
@@ -357,31 +347,24 @@ final class ImapClient
         $r = $this->command("UID COPY {$uid} " . $this->quoteString($targetFolder));
         if (!$r->isOk()) { return Result::err(null, $r->diagnostics()); }
 
-        $r = $this->command("UID STORE {$uid} +FLAGS (\\Deleted)");
-        if (!$r->isOk()) { return Result::err(null, $r->diagnostics()); }
-
-        $this->command("EXPUNGE");
-        return Result::ok(true);
+        return $this->expungeMessage($uid);
     }
 
-    /**
-     * Delete a message (marks deleted and expunges, or moves to Trash).
+    /** Move to Trash, or permanently remove the message when there is no Trash destination.
      * @return Result<bool>
      */
     public function deleteMessage(int $uid, string $trashFolder = 'Trash'): Result
     {
-        // Try to move to Trash first; if it fails just hard-delete
-        $r = $this->command("UID COPY {$uid} " . $this->quoteString($trashFolder));
-        if ($r->isOk()) {
-            $this->command("UID STORE {$uid} +FLAGS (\\Deleted)");
-            $this->command("EXPUNGE");
-            return Result::ok(true);
-        }
-        // No Trash — just mark deleted
-        $r = $this->command("UID STORE {$uid} +FLAGS (\\Deleted)");
-        if (!$r->isOk()) { return Result::err(null, $r->diagnostics()); }
-        $this->command("EXPUNGE");
-        return Result::ok(true);
+        return $trashFolder === '' ? $this->expungeMessage($uid) : $this->moveMessage($uid, $trashFolder);
+    }
+
+    /** @return Result<bool> */
+    private function expungeMessage(int $uid): Result
+    {
+        $marked = $this->command("UID STORE {$uid} +FLAGS (\\Deleted)");
+        if (!$marked->isOk()) { return Result::err(null, $marked->diagnostics()); }
+        $expunged = $this->command("EXPUNGE");
+        return $expunged->isOk() ? Result::ok(true) : Result::err(null, $expunged->diagnostics());
     }
 
     /**
@@ -594,7 +577,7 @@ final class ImapClient
         }
 
         $tagged = $this->readTaggedResponse($tag);
-        if (str_starts_with($tagged, $tag . ' OK')) {
+        if (strtoupper(explode(' ', $tagged, 3)[1] ?? '') === 'OK') {
             return Result::ok($tagged);
         }
         // NO or BAD
