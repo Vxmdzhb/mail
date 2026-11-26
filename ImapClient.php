@@ -387,12 +387,18 @@ final class ImapClient
         return $r->isOk() ? Result::ok(true) : Result::err(null, $r->diagnostics());
     }
 
+    /** UID the server gave the last appended message (UIDPLUS), 0 when it did not say. */
+    private int $lastAppendUid = 0;
+
+    public function lastAppendUid(): int { return $this->lastAppendUid; }
+
     /**
-     * Append a sent message to the Sent folder.
+     * Append a message to a folder (Sent, or Drafts for a draft).
      * @return Result<bool>
      */
     public function appendToSent(string $rawMessage, string $sentFolder = 'Sent'): Result
     {
+        $this->lastAppendUid = 0;
         $len = strlen($rawMessage);
         $tag = $this->nextTag();
         $this->writeLine("{$tag} APPEND " . $this->quoteString($sentFolder) . " (\\Seen) {{$len}}");
@@ -409,6 +415,9 @@ final class ImapClient
         }
         $this->writeLine($rawMessage);
         $resp = $this->readTaggedResponse($tag);
+        if (preg_match('/\[APPENDUID \d+ (\d+)\]/i', $resp, $m)) {
+            $this->lastAppendUid = (int) $m[1];
+        }
         return str_starts_with($resp, $tag . ' OK')
             ? Result::ok(true)
             : $this->err('append', $resp);
@@ -1055,6 +1064,8 @@ final class ImapClient
             'from'      => $this->mimeDecodeHeader($headers['from']              ?? ''),
             'to'        => $this->mimeDecodeHeader($headers['to']                ?? ''),
             'cc'        => $this->mimeDecodeHeader($headers['cc']                ?? ''),
+            'bcc'       => $this->mimeDecodeHeader($headers['bcc']               ?? ''),
+            'reply_to'  => $this->mimeDecodeHeader($headers['reply-to']          ?? ''),
             'date'      => $headers['date']                                       ?? '',
             'message_id'=> $headers['message-id']                                ?? '',
             'body_text'   => '',
