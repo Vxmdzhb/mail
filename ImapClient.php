@@ -1224,15 +1224,76 @@ final class ImapClient
      */
     private function extractFilename(array $headers): string
     {
-        $disposition = $headers['content-disposition'] ?? '';
-        if (preg_match('/filename\*?=["\']?([^"\'\s;]+)/i', $disposition, $m)) {
-            return $this->mimeDecodeHeader(trim($m[1], '"\''));
+        $name = $this->headerParameter($headers['content-disposition'] ?? '', 'filename');
+        if ($name === '') {
+            $name = $this->headerParameter($headers['content-type'] ?? '', 'name');
         }
-        $ct = $headers['content-type'] ?? '';
-        if (preg_match('/name=["\']?([^"\'\s;]+)/i', $ct, $m)) {
-            return $this->mimeDecodeHeader(trim($m[1], '"\''));
+        // A path in a name is never wanted; keep the last component.
+        $name = str_replace('\\', '/', $name);
+        $slash = strrpos($name, '/');
+        return trim($slash === false ? $name : substr($name, $slash + 1));
+    }
+
+    /**
+     * One parameter of a structured header such as Content-Disposition, in
+     * every form senders use (RFC 2045, 2047 and 2231):
+     *   filename="two words.pdf"            quoted, spaces and all
+     *   filename=plain.txt                  a token
+     *   filename*=utf-8''caff%C3%A8.txt     charset and percent-encoding
+     *   filename*0*=...; filename*1*=...    continuations, in order
+     *   filename="=?UTF-8?B?...?="          an encoded word, as many clients do
+     */
+    private function headerParameter(string $header, string $param): string
+    {
+        $params = [];
+        // Skip the value before the first ';' (the type or disposition).
+        $pos = strpos($header, ';');
+        if ($pos === false) { return ''; }
+        $rest = substr($header, $pos + 1);
+        $pattern = '/\s*([^=;\s]+)\s*=\s*("(?:[^"\\\\]|\\\\.)*"|[^;]*)\s*;?/s';
+        if (preg_match_all($pattern, $rest, $all, PREG_SET_ORDER)) {
+            foreach ($all as $m) {
+                $value = trim($m[2]);
+                if ($value !== '' && $value[0] === '"') {
+                    $value = (string) preg_replace('/\\\\(.)/s', '$1', substr($value, 1, -1));
+                }
+                $params[strtolower($m[1])] = $value;
+            }
         }
-        return '';
+        $param = strtolower($param);
+
+        // RFC 2231: name*=charset'lang'value, or name*0, name*1*, ... in order.
+        $pieces = [];
+        $charset = '';
+        if (isset($params[$param . '*'])) {
+            $pieces[] = [$params[$param . '*'], true];
+        } else {
+            for ($i = 0; ; $i++) {
+                if (isset($params["{$param}*{$i}*"])) {
+                    $pieces[] = [$params["{$param}*{$i}*"], true];
+                } elseif (isset($params["{$param}*{$i}"])) {
+                    $pieces[] = [$params["{$param}*{$i}"], false];
+                } else {
+                    break;
+                }
+            }
+        }
+        if ($pieces !== []) {
+            $out = '';
+            foreach ($pieces as $n => [$piece, $encoded]) {
+                if ($encoded) {
+                    if ($n === 0 && preg_match("/^([^']*)'[^']*'(.*)$/s", $piece, $cm)) {
+                        $charset = $cm[1];
+                        $piece   = $cm[2];
+                    }
+                    $piece = rawurldecode($piece);
+                }
+                $out .= $piece;
+            }
+            return $charset !== '' ? $this->toUtf8($out, strtoupper($charset)) : $out;
+        }
+
+        return isset($params[$param]) ? $this->mimeDecodeHeader($params[$param]) : '';
     }
 
     private function extractCharset(string $contentType): string
