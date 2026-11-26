@@ -457,7 +457,10 @@ final class ImapClient
         if (!is_resource($sock)) {
             // A TLS failure leaves $errstr empty; the reason is in the warning.
             $why = is_string($errstr) && $errstr !== '' ? $errstr : ($warning !== '' ? $warning : 'no reason given');
-            throw new \RuntimeException("IMAP connect to {$this->host}:{$this->port} failed: $why ($errno)" . $this->certificateHint($why));
+            throw new \RuntimeException(
+                "IMAP connect to {$this->host}:{$this->port}{$this->resolvedAddress()} failed: $why ($errno)"
+                . $this->certificateHint($why) . $this->handshakeHint($why)
+            );
         }
         stream_set_timeout($sock, $this->timeout);
         return $sock;
@@ -548,6 +551,36 @@ final class ImapClient
         }
         $warning = (string) preg_replace('/(^|; )stream_socket_(client|enable_crypto)\(\): /', '$1', $warning);
         return [$result, $warning];
+    }
+
+    /** " (203.0.113.7)": the address the host name resolved to, here, on the web server. */
+    private function resolvedAddress(): string
+    {
+        if (filter_var($this->host, FILTER_VALIDATE_IP) !== false) {
+            return '';
+        }
+        $ip = gethostbyname($this->host);
+        return $ip !== $this->host ? " ($ip)" : ' (the name did not resolve)';
+    }
+
+    /**
+     * Explain a handshake that ended without an OpenSSL error: the far end
+     * accepted the TCP connection, read the TLS hello and hung up, or never
+     * answered. The mail server would have sent a TLS alert, so something in
+     * between is refusing the connection.
+     */
+    private function handshakeHint(string $reason): string
+    {
+        if (stripos($reason, 'enable crypto') === false || stripos($reason, 'OpenSSL Error') !== false) {
+            return '';
+        }
+        $try = " From the web server, try: openssl s_client -connect {$this->host}:{$this->port} -servername {$this->host}";
+        if (stripos($reason, 'timed out') !== false) {
+            return '. The TLS handshake got no answer in time.' . $try;
+        }
+        return '. The connection was closed during the TLS handshake without a TLS error, so something between'
+            . ' this web server and the mail server refused it: a firewall, a proxy, or, when the mail server runs on'
+            . ' this same machine, a connection to its own public address (then set imap_host to 127.0.0.1).' . $try;
     }
 
     /** Explain the usual cause when the certificate was the problem. */
