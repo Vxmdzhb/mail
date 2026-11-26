@@ -429,8 +429,9 @@ final class ImapClient
     /** @return resource */
     private function openSocket(): mixed
     {
-        $errno  = 0;
-        $errstr = '';
+        $errno   = 0;
+        $errstr  = '';
+        $warning = '';
         if ($this->socks5Host !== '') {
             $sock = $this->connectViaSocks5();
         } elseif ($this->encryption === 'ssl') {
@@ -439,18 +440,24 @@ final class ImapClient
                 'verify_peer_name'  => $this->verifySsl,
                 'allow_self_signed' => !$this->verifySsl,
             ]]);
-            $sock = @stream_socket_client(
-                "ssl://{$this->host}:{$this->port}", $errno, $errstr,
-                $this->timeout, STREAM_CLIENT_CONNECT, $ctx
-            );
+            [$sock, $warning] = self::capturingWarning(function () use (&$errno, &$errstr, $ctx) {
+                return stream_socket_client(
+                    "ssl://{$this->host}:{$this->port}", $errno, $errstr,
+                    $this->timeout, STREAM_CLIENT_CONNECT, $ctx
+                );
+            });
         } else {
-            $sock = @stream_socket_client(
-                "tcp://{$this->host}:{$this->port}", $errno, $errstr,
-                $this->timeout
-            );
+            [$sock, $warning] = self::capturingWarning(function () use (&$errno, &$errstr) {
+                return stream_socket_client(
+                    "tcp://{$this->host}:{$this->port}", $errno, $errstr,
+                    $this->timeout
+                );
+            });
         }
-        if ($sock === false) {
-            throw new \RuntimeException("IMAP connect to {$this->host}:{$this->port} failed: $errstr ($errno)");
+        if (!is_resource($sock)) {
+            // A TLS failure leaves $errstr empty; the reason is in the warning.
+            $why = is_string($errstr) && $errstr !== '' ? $errstr : ($warning !== '' ? $warning : 'no reason given');
+            throw new \RuntimeException("IMAP connect to {$this->host}:{$this->port} failed: $why ($errno)" . $this->certificateHint($why));
         }
         stream_set_timeout($sock, $this->timeout);
         return $sock;
@@ -487,8 +494,9 @@ final class ImapClient
             // defeating the intended graceful "re-login" degradation on the onion
             // IMAPS path. The !== true check still fails closed (R7-02, matching
             // Mailer)..
-            if (@stream_socket_enable_crypto($proxy, true, STREAM_CRYPTO_METHOD_TLS_CLIENT) !== true) {
-                throw new \RuntimeException('IMAP TLS handshake over SOCKS5 proxy failed');
+            [$ok, $warning] = self::capturingWarning(fn () => stream_socket_enable_crypto($proxy, true, STREAM_CRYPTO_METHOD_TLS_CLIENT));
+            if ($ok !== true) {
+                throw new \RuntimeException('IMAP TLS handshake over SOCKS5 proxy failed: ' . $warning . $this->certificateHint($warning));
             }
         }
         return $proxy;
@@ -509,10 +517,46 @@ final class ImapClient
         // @-suppress the handshake warning (else the ErrorHandler forces a 500
         // that defeats the graceful re-login path); the boolean check still fails
         // closed before any cleartext LOGIN (matching Mailer)..
-        if (!@stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
-            return $this->err('starttls', 'TLS negotiation failed');
+        [$ok, $warning] = self::capturingWarning(fn () => stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT));
+        if ($ok !== true) {
+            return $this->err('starttls', 'TLS negotiation failed: ' . $warning . $this->certificateHint($warning));
         }
         return Result::ok(true);
+    }
+
+    /**
+     * Run a stream call, keeping the text of the warning it raises instead of
+     * letting it reach the site's error handler (which would turn it into a
+     * 500). The warning is the only place PHP gives the reason a TLS handshake
+     * failed, such as a certificate that did not verify.
+     *
+     * @template T
+     * @param callable(): T $call
+     * @return array{T, string}
+     */
+    private static function capturingWarning(callable $call): array
+    {
+        $warning = '';
+        set_error_handler(static function (int $level, string $message) use (&$warning): bool {
+            $warning = $warning === '' ? $message : $warning . '; ' . $message;
+            return true;
+        });
+        try {
+            $result = $call();
+        } finally {
+            restore_error_handler();
+        }
+        $warning = (string) preg_replace('/(^|; )stream_socket_(client|enable_crypto)\(\): /', '$1', $warning);
+        return [$result, $warning];
+    }
+
+    /** Explain the usual cause when the certificate was the problem. */
+    private function certificateHint(string $reason): string
+    {
+        if (!$this->verifySsl || stripos($reason, 'certificate') === false) {
+            return '';
+        }
+        return '. The server\'s certificate was not accepted; a self-signed certificate needs imap_verify_ssl set to false.';
     }
 
     /**
