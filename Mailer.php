@@ -127,6 +127,11 @@ final class Mailer
      * @param list<array{filename:string,content_type:string,data:string}> $attachments
      *        Optional attachments: the name shown to the recipient, the MIME
      *        type, and the raw bytes (encoded here).
+     * @param string $toAddress  One address, or a comma-separated list; each may
+     *                           carry a display name ("Ann <ann@example.org>").
+     *                           $cc, $bcc and $replyTo take the same form.
+     * @param string $inReplyTo  The Message-ID being answered ("<id@host>"), so
+     *                           the reply joins its thread; '' for none.
      * @return Result<bool>
      */
     public function send(
@@ -142,6 +147,8 @@ final class Mailer
         array  $attachments         = [],
         string $cc                  = '',
         string $bcc                 = '',
+        string $replyTo             = '',
+        string $inReplyTo           = '',
     )
     : Result {
         try {
@@ -158,6 +165,8 @@ final class Mailer
                 $attachments,
                 $cc,
                 $bcc,
+                $replyTo,
+                $inReplyTo,
             );
         } catch (\Throwable $e) {
             return $this->err($e->getMessage());
@@ -185,6 +194,8 @@ final class Mailer
         array  $attachments         = [],
         string $cc                  = '',
         string $bcc                 = '',
+        string $replyTo             = '',
+        string $inReplyTo           = '',
     )
     : Result {
         $effectiveFromAddress = $fromAddressOverride !== '' ? $fromAddressOverride : $this->fromAddress;
@@ -197,22 +208,38 @@ final class Mailer
         // address SHAPE and header-safety of every operator-influenced field
         // BEFORE opening the socket — on any violation we return a Result and
         // never dial the server.
-        foreach ([$effectiveFromAddress, $toAddress] as $addr) {
-            if (!$this->validAddress($addr)) {
-                return $this->invalidRecipient($addr);
+        // Address lists, display names and all ("Ann <ann@example.org>, bob@...").
+        // The envelope gets the bare addresses; the headers keep the names.
+        $toList      = $this->parseAddressList($toAddress);
+        if (count($toList) === 1 && $toList[0]['name'] === '' && $toName !== '') {
+            $toList[0]['name'] = $toName;
+        }
+        $ccList      = $this->parseAddressList($cc);
+        $bccList     = $this->parseAddressList($bcc);
+        $replyToList = $this->parseAddressList($replyTo);
+        if ($toList === []) {
+            return $this->invalidRecipient($toAddress);
+        }
+        if (!$this->validAddress($effectiveFromAddress)) {
+            return $this->invalidRecipient($effectiveFromAddress);
+        }
+        foreach ([...$toList, ...$ccList, ...$bccList, ...$replyToList] as $entry) {
+            if (!$this->validAddress($entry['address'])) {
+                return $this->invalidRecipient($entry['address']);
+            }
+            if (!$this->headerSafe($entry['name'])) {
+                return $this->invalidRecipient($entry['name']);
             }
         }
-        foreach ([$effectiveFromName, $toName, $subject] as $headerText) {
+        // Only a well-formed Message-ID is passed on; anything else is dropped
+        // rather than refusing the whole message.
+        $inReplyTo = trim($inReplyTo);
+        if (preg_match('/^<[^<>\s]+>$/', $inReplyTo) !== 1) {
+            $inReplyTo = '';
+        }
+        foreach ([$effectiveFromName, $subject] as $headerText) {
             if (!$this->headerSafe($headerText)) {
                 return $this->invalidRecipient($headerText);
-            }
-        }
-        // Cc/Bcc envelope recipients: validate each before dialing.
-        $ccList  = $this->parseAddressList($cc);
-        $bccList = $this->parseAddressList($bcc);
-        foreach (array_merge($ccList, $bccList) as $extraAddr) {
-            if (!$this->validAddress($extraAddr)) {
-                return $this->invalidRecipient($extraAddr);
             }
         }
 
@@ -297,14 +324,15 @@ final class Mailer
         $this->cmd($sock, "MAIL FROM:<{$effectiveFromAddress}>");
         $this->read($sock, '250');
 
-        $this->cmd($sock, "RCPT TO:<{$toAddress}>");
+        $this->cmd($sock, "RCPT TO:<{$toList[0]['address']}>");
         $this->read($sock, '25');   // 250 or 251
 
-        // Deliver to every Cc and Bcc recipient too. Bcc addresses are
-        // RCPT'd here but deliberately NOT emitted as a header below. A rejected
-        // SECONDARY recipient must NOT abort delivery to the accepted ones (the
-        // primary To already succeeded above), so skip a failed cc/bcc and carry on.
-        foreach (array_merge($ccList, $bccList) as $rcptAddr) {
+        // Deliver to every other To, Cc and Bcc recipient too. Bcc addresses
+        // are RCPT'd here but deliberately NOT emitted as a header below. A
+        // rejected SECONDARY recipient must NOT abort delivery to the accepted
+        // ones (the first To already succeeded above), so skip it and carry on.
+        foreach ([...array_slice($toList, 1), ...$ccList, ...$bccList] as $rcpt) {
+            $rcptAddr = $rcpt['address'];
             try {
                 $this->cmd($sock, "RCPT TO:<{$rcptAddr}>");
                 $this->read($sock, '25');
@@ -320,8 +348,8 @@ final class Mailer
         $boundary = bin2hex(random_bytes(12));
         $hasAttachments = $attachments !== [];
         $headers = $this->buildHeaders(
-            $toAddress,
-            $toName,
+            $this->formatAddressList($toList),
+            '',
             $subject,
             $boundary,
             $bodyHtml !== '',
@@ -330,7 +358,9 @@ final class Mailer
             $priority,
             $readReceipt,
             $hasAttachments,
-            implode(', ', $ccList),
+            $this->formatAddressList($ccList),
+            $this->formatAddressList($replyToList),
+            $inReplyTo,
         );
         $body = $this->buildBody($bodyText, $bodyHtml, $boundary, $attachments);
 
@@ -555,20 +585,73 @@ final class Mailer
     }
 
     /**
-     * Split a comma-separated address list into trimmed, non-empty parts.
+     * Split an address list into addresses and display names:
+     *   ann@example.org, "Doe, John" <john@example.org>, Bob <bob@example.org>
+     * Commas inside quotes or angle brackets do not split.
      *
-     * @return list<string>
+     * @return list<array{address:string,name:string}>
      */
     private function parseAddressList(string $list): array
     {
+        $parts = [];
+        $current = '';
+        $quoted = false;
+        $angle = false;
+        $len = strlen($list);
+        for ($i = 0; $i < $len; $i++) {
+            $c = $list[$i];
+            if ($c === '\\' && $quoted && $i + 1 < $len) {
+                $current .= $c . $list[++$i];
+                continue;
+            }
+            if ($c === '"') { $quoted = !$quoted; }
+            elseif ($c === '<' && !$quoted) { $angle = true; }
+            elseif ($c === '>' && !$quoted) { $angle = false; }
+            if (($c === ',' || $c === ';') && !$quoted && !$angle) {
+                $parts[] = $current;
+                $current = '';
+                continue;
+            }
+            $current .= $c;
+        }
+        $parts[] = $current;
+
         $out = [];
-        foreach (explode(',', $list) as $part) {
-            $addr = trim($part);
-            if ($addr !== '') {
-                $out[] = $addr;
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if ($part === '') { continue; }
+            if (preg_match('/^(.*)<([^<>]*)>$/s', $part, $m)) {
+                $name = trim($m[1]);
+                if (strlen($name) >= 2 && $name[0] === '"' && str_ends_with($name, '"')) {
+                    $name = (string) preg_replace('/\\\\(.)/s', '$1', substr($name, 1, -1));
+                }
+                $out[] = ['address' => trim($m[2]), 'name' => $name];
+            } else {
+                $out[] = ['address' => $part, 'name' => ''];
             }
         }
         return $out;
+    }
+
+    /** @param list<array{address:string,name:string}> $list */
+    private function formatAddressList(array $list): string
+    {
+        return implode(', ', array_map(fn (array $a): string => $this->formatAddress($a['address'], $a['name']), $list));
+    }
+
+    /**
+     * One address for a header. A display name that is not plain ASCII is
+     * sent as an RFC 2047 encoded word, as header bytes must be ASCII.
+     */
+    private function formatAddress(string $address, string $name): string
+    {
+        if ($name === '') {
+            return '<' . $address . '>';
+        }
+        $shown = preg_match('/[^\x20-\x7E]/', $name) === 1
+            ? '=?UTF-8?B?' . base64_encode($name) . '?='
+            : '"' . addcslashes($name, '"\\') . '"';
+        return $shown . ' <' . $address . '>';
     }
 
     private function buildHeaders(
@@ -583,18 +666,19 @@ final class Mailer
         bool   $readReceipt  = false,
         bool   $hasAttachments = false,
         string $cc           = '',
+        string $replyTo      = '',
+        string $inReplyTo    = '',
     )
     : string {
         if ($fromAddress === '') { $fromAddress = $this->fromAddress; }
         if ($fromName    === '') { $fromName    = $this->fromName; }
-        // Escape the quoted display name: a " or \ would otherwise break
-        // the quoted-string and could forge trailing header tokens. headerSafe()
-        // already blocked CR/LF/NUL upstream.
-        $from = $fromName !== '' ?
-            '"' . addcslashes($fromName, '"\\') . '" <' . $fromAddress . '>' :
-            '<' . $fromAddress . '>';
-        $to = $toName !== '' ? '"' . addcslashes($toName, '"\\') . '" <' . $toAddress . '>' :
-            '<' . $toAddress . '>';
+        // formatAddress() escapes the quoted display name: a " or \ would
+        // otherwise break the quoted-string and could forge trailing header
+        // tokens. headerSafe() already blocked CR/LF/NUL upstream.
+        $from = $this->formatAddress($fromAddress, $fromName);
+        // $toAddress arrives as a header-ready list (formatAddressList) unless
+        // a name is given with a single bare address.
+        $to = $toName !== '' ? $this->formatAddress($toAddress, $toName) : $toAddress;
         $msgId = '<' .
                  bin2hex(random_bytes(12)) .
                  '@' .
@@ -607,6 +691,13 @@ final class Mailer
         $h .= "To: {$to}\r\n";
         if ($cc !== '') {
             $h .= "Cc: {$cc}\r\n"; // addresses already validated in doSend
+        }
+        if ($replyTo !== '') {
+            $h .= "Reply-To: {$replyTo}\r\n";
+        }
+        if ($inReplyTo !== '') {
+            $h .= "In-Reply-To: {$inReplyTo}\r\n";
+            $h .= "References: {$inReplyTo}\r\n";
         }
         $h .= "Subject: {$subject}\r\n";
         $h .= "Date: {$date}\r\n";
