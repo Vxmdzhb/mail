@@ -886,8 +886,10 @@ final class ImapClient
     }
 
     /**
-     * Extract ENVELOPE fields: date, subject, from, reply-to, to, cc, bcc, message-id.
-     * ENVELOPE format: ("date" "subject" (from) (reply-to) (to) (cc) (bcc) (in-reply-to) "message-id")
+     * Extract ENVELOPE fields: date, subject, from, sender, reply-to, to, cc,
+     * bcc, in-reply-to, message-id.
+     * ENVELOPE format (RFC 3501 7.4.2):
+     *   ("date" "subject" (from) (sender) (reply-to) (to) (cc) (bcc) "in-reply-to" "message-id")
      * This is a simplified parser for the common case.
      * @return array<string,string>
      */
@@ -903,12 +905,14 @@ final class ImapClient
         return [
             'date'       => $tokens[0] ?? '',
             'subject'    => $tokens[1] ?? '',
-            'from'       => $this->parseAddressList($tokens[2] ?? ''),
-            'reply-to'   => $this->parseAddressList($tokens[3] ?? ''),
-            'to'         => $this->parseAddressList($tokens[4] ?? ''),
-            'cc'         => $this->parseAddressList($tokens[5] ?? ''),
-            'bcc'        => $this->parseAddressList($tokens[6] ?? ''),
-            'message-id' => $tokens[8] ?? '',
+            'from'        => $this->parseAddressList($tokens[2] ?? ''),
+            'sender'      => $this->parseAddressList($tokens[3] ?? ''),
+            'reply-to'    => $this->parseAddressList($tokens[4] ?? ''),
+            'to'          => $this->parseAddressList($tokens[5] ?? ''),
+            'cc'          => $this->parseAddressList($tokens[6] ?? ''),
+            'bcc'         => $this->parseAddressList($tokens[7] ?? ''),
+            'in-reply-to' => $tokens[8] ?? '',
+            'message-id'  => $tokens[9] ?? '',
         ];
     }
 
