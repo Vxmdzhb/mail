@@ -215,19 +215,27 @@ final class ImapClient
 
     /**
      * Fetch a page of message headers from the currently selected folder.
-     * Messages are returned newest-first (highest UIDs first).
-     * Each entry: [uid, flags, subject, from_display, date_str, date_ts, seen].
+     * Messages are returned newest-first (highest UIDs first), or oldest-first
+     * when $oldestFirst is set: page 1 is then the oldest messages of the
+     * folder, not the newest page turned upside down.
+     * Each entry: [uid, flags, subject, from_display, to_display, date_str, date_ts, seen].
      *
-     * @return Result<list<array{uid:int,flags:list<string>,subject:string,from_display:string,date_str:string,date_ts:int,seen:bool}>>
+     * @return Result<list<array{uid:int,flags:list<string>,subject:string,from_display:string,to_display:string,date_str:string,date_ts:int,seen:bool}>>
      */
-    public function fetchHeadersPage(int $total, int $page, int $perPage): Result
+    public function fetchHeadersPage(int $total, int $page, int $perPage, bool $oldestFirst = false): Result
     {
         if ($total === 0) { return Result::ok([]); }
 
         // Calculate sequence range (seq numbers, not UIDs, for the range query)
         // Newest messages have highest sequence numbers.
-        $high = $total - (($page - 1) * $perPage);
-        $low  = max(1, $high - $perPage + 1);
+        if ($oldestFirst) {
+            $low  = ($page - 1) * $perPage + 1;
+            $high = min($total, $low + $perPage - 1);
+        } else {
+            $high = $total - (($page - 1) * $perPage);
+            $low  = max(1, $high - $perPage + 1);
+        }
+        if ($low > $high) { return Result::ok([]); }
         $set  = "{$low}:{$high}";
 
         // Fetch envelope+flags for the sequence range
@@ -245,6 +253,7 @@ final class ImapClient
             $env     = $this->extractEnvelope($data);
             $subject = $this->mimeDecodeHeader($env['subject'] ?? '(no subject)');
             $from    = $this->formatAddress($env['from'] ?? '');
+            $to      = $this->formatAddress($env['to'] ?? '');
             $dateStr = $env['date'] ?? '';
             $dateTs  = $dateStr ? (int) @strtotime($dateStr) : 0;
 
@@ -255,14 +264,15 @@ final class ImapClient
                 'flags'        => $flags,
                 'subject'      => $subject ?: '(no subject)',
                 'from_display' => $from,
+                'to_display'   => $to,
                 'date_str'     => $dateStr,
                 'date_ts'      => $dateTs,
                 'seen'         => $seen,
             ];
         }
 
-        // Sort newest first by UID descending
-        usort($messages, fn($a, $b) => $b['uid'] <=> $a['uid']);
+        // Newest first by UID descending, or oldest first ascending.
+        usort($messages, fn($a, $b) => $oldestFirst ? $a['uid'] <=> $b['uid'] : $b['uid'] <=> $a['uid']);
         return Result::ok($messages);
     }
 
